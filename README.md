@@ -7,8 +7,11 @@
 当前舞蹈任务为 `Mjlab-SideKickReference-Flat-MicroDuck`（`lifted_sidekick_v2`）。
 
 - [训练、同步和本地 agent 接入说明](docs/sidekick_dance_training.md#共享仓库与本地推理接入)
-- [model_3000 测试模型](policies/sidekick_reference_v2/model_3000/policy.onnx)
-- [模型版本、SHA256 和完整部署接口](policies/sidekick_reference_v2/model_3000/metadata.json)
+- [model_6000 测试模型 ONNX](policies/sidekick_reference_v2/model_6000/policy.onnx)
+- [model_6000 训练 checkpoint](policies/sidekick_reference_v2/model_6000/model_6000.pt)
+- [模型版本、SHA256 和完整部署接口](policies/sidekick_reference_v2/model_6000/metadata.json)
+
+`model_6000` 是训练中的第 6000 轮快照；保留 `model_3000` 目录供对照。
 
 本模型需要运行时提供 **1.2 秒 cos/sin 节拍**；使用 `infer_policy.py --dance`
 接入，不能将舞蹈模型直接当作 `--walking`。启动命令与验证范围见下面的 macOS
@@ -112,7 +115,8 @@ training DR ranges to one value, `--no-bam` falls back to the XML PD actuators.
 ### Local SideKickDance inference on macOS
 
 The shared `lifted_sidekick_v2` checkpoint is included at
-`policies/sidekick_reference_v2/model_3000/policy.onnx`. Its adjacent
+`policies/sidekick_reference_v2/model_6000/policy.onnx`. The original training
+checkpoint `model_6000.pt` is included in the same directory. Its adjacent
 `metadata.json` is loaded automatically: SHA256, float32 `[1,61] -> [1,14]`,
 tensor names, HOME, joint order, timing and BAM parameters are checked.
 
@@ -124,7 +128,7 @@ PYTHON_LIBDIR=$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.ge
 env -u MUJOCO_GL -u DISPLAY \
   DYLD_FALLBACK_LIBRARY_PATH="$PYTHON_LIBDIR:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}" \
   uv run --no-sync mjpython scripts/infer_policy.py \
-    --dance policies/sidekick_reference_v2/model_3000/policy.onnx \
+    --dance policies/sidekick_reference_v2/model_6000/policy.onnx \
     --new-cmd-obs
 ```
 
@@ -150,7 +154,7 @@ the dance policy to zero-command walking/standing (or sitstand standing).
 Then Y/R and velocity/head/body controls work normally. Dance and its idle
 mode own the command slots until X releases control.
 
-The period comes from metadata (1.2 s for model_3000); an explicit
+The period comes from metadata (1.2 s for these sidekick models); an explicit
 `--dance-period` must match it. Legacy ONNX files without a sidecar default to
 1.2 s and accept a finite positive override. At 50 Hz, the phase advances by `0.02 / dance_period` per
 active control step, independent of rendering delays. Starting resets phase to

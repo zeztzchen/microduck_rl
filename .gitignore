@@ -24,6 +24,7 @@ nohup.out
 *.onnx
 # Selected deployment versions shared with the local inference checkout.
 !policies/sidekick_reference_v2/model_3000/policy.onnx
+!policies/sidekick_reference_v2/model_6000/policy.onnx
 beyondmimic_motions/
 artifacts/
 *.npz
@@ -33,6 +34,7 @@ src/mjlab_microduck/robot/microduck.bak/*
 src/mjlab_microduck/robot/microduck_test/*
 data/
 *.pt
+!policies/sidekick_reference_v2/model_6000/model_6000.pt
 
 claude_experiments/
 

@@ -1,0 +1,167 @@
+{
+  "task": "Mjlab-SideKickReference-Flat-MicroDuck",
+  "recipe_version": "lifted_sidekick_v2",
+  "checkpoint": "model_6000.pt",
+  "checkpoint_iteration": 6000,
+  "checkpoint_sha256": "4afdd53059ac1676155a926c45aceeb47c535093c96ee90d667e325b8c3ff1ba",
+  "onnx": "policy.onnx",
+  "onnx_bytes": 793756,
+  "onnx_sha256": "d8f35e262c4b974224993009b945629fdc1e6abd994b8de3f2d9867cbe6eb9ff",
+  "validated_at": "2026-10-16T17:47:45+08:00",
+  "input": {
+    "name": "obs",
+    "shape": [
+      1,
+      61
+    ]
+  },
+  "output": {
+    "name": "actions",
+    "shape": [
+      1,
+      14
+    ]
+  },
+  "observation_normalizer_baked_in": true,
+  "finite_outputs": {
+    "dance_phases": 8,
+    "idle": true
+  },
+  "deployment": {
+    "control_hz": 50,
+    "period_s": 1.2,
+    "obs_3_6": "projected gravity, not raw accelerometer",
+    "obs_48_51": "[cos(2*pi*t/1.2), sin(2*pi*t/1.2), 0]",
+    "obs_51_61": "zeros for head/body commands",
+    "idle_command": "all 13 command entries zero",
+    "action": "14 HOME-relative joint position offsets, scale=1.0, BAM, no extra low-pass filter",
+    "scene": "src/mjlab_microduck/robot/microduck/scene.xml",
+    "physics_timestep_s": 0.005,
+    "decimation": 4,
+    "observation_dtype": "float32",
+    "observation_layout": [
+      {
+        "slice": [
+          0,
+          3
+        ],
+        "name": "base_ang_vel",
+        "units": "rad/s"
+      },
+      {
+        "slice": [
+          3,
+          6
+        ],
+        "name": "projected_gravity",
+        "units": "unit direction"
+      },
+      {
+        "slice": [
+          6,
+          20
+        ],
+        "name": "joint_pos_minus_home",
+        "units": "rad"
+      },
+      {
+        "slice": [
+          20,
+          34
+        ],
+        "name": "joint_vel",
+        "units": "rad/s"
+      },
+      {
+        "slice": [
+          34,
+          48
+        ],
+        "name": "previous_raw_action"
+      },
+      {
+        "slice": [
+          48,
+          51
+        ],
+        "name": "dance_clock_cos_sin_zero"
+      },
+      {
+        "slice": [
+          51,
+          55
+        ],
+        "name": "head_pose_command_zero"
+      },
+      {
+        "slice": [
+          55,
+          61
+        ],
+        "name": "body_pose_command_zero"
+      }
+    ],
+    "joint_order": [
+      "left_hip_yaw",
+      "left_hip_roll",
+      "left_hip_pitch",
+      "left_knee",
+      "left_ankle",
+      "neck_pitch",
+      "head_pitch",
+      "head_yaw",
+      "head_roll",
+      "right_hip_yaw",
+      "right_hip_roll",
+      "right_hip_pitch",
+      "right_knee",
+      "right_ankle"
+    ],
+    "home_rad": [
+      0.0,
+      -0.0873,
+      -0.4579,
+      -0.0049,
+      0.453,
+      0.3491,
+      0.3491,
+      0.0,
+      0.0,
+      0.0,
+      0.0873,
+      0.4579,
+      0.0049,
+      -0.453
+    ],
+    "action_scale": 1.0,
+    "bam": {
+      "motor": "xl330",
+      "model": "m6",
+      "kp_fw": 200.0,
+      "vin": 7.4,
+      "vin_drop_gain": 0.1,
+      "vin_min": 6.0,
+      "max_current": null
+    },
+    "inference_note": "Use scripts/infer_policy.py --dance policy.onnx --new-cmd-obs; the adjacent metadata.json is validated automatically. D starts/stops the 1.2 s simulation-time clock."
+  },
+  "behavior_evaluation": "Three 8-second CPU MuJoCo/BAM trials without rendering or domain randomization: no falls; asymmetric foot lift and horizontal drift remain. See evaluation.json. No rendered or hardware validation of this checkpoint.",
+  "training_run": "2026-10-16_13-54-26_sidekick_reference_v2_20261016_134844_363a37",
+  "upstream_repository": "https://github.com/pollen-robotics/microduck_rl",
+  "checkpoint_bytes": 4843445,
+  "checkpoint_saved_at": "2026-10-16T17:41:15+08:00",
+  "export_code_commit": "1f3cfedbbd91f827e6cf65310e35ca809c212688",
+  "training_arguments": {
+    "task": "Mjlab-SideKickReference-Flat-MicroDuck",
+    "smoke": false,
+    "num_gpus": 2,
+    "envs_per_gpu": 1024,
+    "iterations": 8000,
+    "seed": 42,
+    "logger": "tensorboard",
+    "resume_run": null,
+    "resume_checkpoint": "model_.*.pt",
+    "dry_run": false
+  },
+  "behavior_evaluation_file": "evaluation.json"
+}

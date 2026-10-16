@@ -16,14 +16,21 @@ cd microduck_rl
 两端编辑前先同步；功能改动在各自分支提交，合入 `develop` 后另一端再拉取，
 不要通过强推覆盖对方提交。
 
-本次选定的测试版本直接随 Git 保存：
+最新共享版本为训练中的 **model_6000**，直接随 Git 保存：
+
+- `policies/sidekick_reference_v2/model_6000/model_6000.pt`：原始训练 checkpoint，4843445 字节。
+- 同目录 `policy.onnx`：通过官方 `scripts/export.py` 从该 checkpoint 导出，包含观测归一化。
+- 同目录 `metadata.json`：checkpoint 与 ONNX 的 SHA256、训练来源、完整部署接口。
+
+之前的 **model_3000** 保留用于对照：
 
 - `policies/sidekick_reference_v2/model_3000/policy.onnx`：793813 字节，包含观测归一化。
 - 同目录 `metadata.json`：模型哈希、训练来源、完整观测布局、关节顺序、HOME、BAM 参数。
 - 模型 SHA256：`573a10dc28711f30f48fdc71451843587cea708114f3cedc1163af38fbcebeb2`。
 
 新测试版本使用新的目录并明确加入 `.gitignore` 例外，保留旧版本便于比较。
-日常训练的 `logs/`、`artifacts/`、`.pt`、虚拟环境不进入 Git。
+日常训练的 `logs/`、`artifacts/`、`.pt`、虚拟环境不进入 Git；
+只有上述显式允许的选定 checkpoint 随版本发布。
 仓库的 `uv.lock` 使用公共包源；服务器本机镜像地址的重写不随任务代码提交。
 
 ### 本地推理接口（已接入）
@@ -74,7 +81,7 @@ env -u MUJOCO_GL -u DISPLAY \
     --walking alpha_walking.onnx \
     --sitstand alpha_sitstand.onnx \
     --roulade roulade.onnx \
-    --dance policies/sidekick_reference_v2/model_3000/policy.onnx \
+    --dance policies/sidekick_reference_v2/model_6000/policy.onnx \
     --new-cmd-obs
 ```
 
@@ -109,13 +116,29 @@ uv run --no-sync --with pytest python -m pytest \
   tests/test_infer_policy_viewer.py -q
 
 uv run --no-sync python scripts/eval_sidekick_reference.py \
-  --onnx-file policies/sidekick_reference_v2/model_3000/policy.onnx \
-  --trials 3 --seconds 8 --output /tmp/sidekick-model3000-dance.json
+  --onnx-file policies/sidekick_reference_v2/model_6000/policy.onnx \
+  --trials 3 --seconds 8 --output /tmp/sidekick-model6000-dance.json
 ```
 
 评估命令加 `--idle` 可检查同模型的零命令站立。测试包括模型哈希、8 个相位与
 idle 的有限输出、单位重力、原始动作历史、仿真时间推进/暂停/重置、会话名称、
 命令互斥和坐站/翻滚回归；这些测试不代表抬脚质量或真机部署已经合格。
+
+### model_6000 的服务器无渲染验证（2026-10-16）
+
+原始 checkpoint 哈希与训练目录一致；官方导出包含观测归一化，
+`float32 [1,61] -> [1,14]`、8 个相位与 idle 有限输出检查通过。
+使用刚同步的舞蹈适配器完成 Linux CPU MuJoCo/BAM 复测：seed=42，
+3 次各 8 秒、忽略首秒、关节初始噪声 ±0.01 rad、无 DR、不渲染。
+原始统计在 `policies/sidekick_reference_v2/model_6000/evaluation.json`。
+
+- 跌倒 0/3；踢腿峰值窗口两侧支撑脚接地比例均为 100%。
+- 左脚峰值窗口离地比例 73.21%–77.27%，右脚为 100%。
+- 左/右峰值窗口平均脚底最低点离地约 3.93–4.15 mm / 7.65–7.71 mm。
+- 每次试验相对初始位置的最大水平偏移为 9.02–11.83 cm。
+
+这份快照仍存在左右抬脚不对称和水平漂移；没有对 model_6000 做本地 viewer
+或真机验证。下面 model_3000 的 macOS 观察保留为历史对照，不能视为新版本的验收结果。
 
 ### model_3000 的 macOS 本地验证（2026-10-16）
 
@@ -198,7 +221,7 @@ v2 修改的是奖励目标，旧 ONNX 的行为不会因此改变，需要重�
   关节跟踪与 actor 使用相同的编码器视图，兼容 passive/backlash 关节。
   去掉 walking 的奖励和课程，动作仍为 14 维、50 Hz、无额外滤波。
 
-v2 是修正版配方；本仓库附带 model_3000，已完成的本机验证及局限见前文。
+v2 是修正版配方；本仓库附带 model_3000 和 model_6000，分别已完成的验证及局限见前文。
 运动学可达、测试通过和 smoke 完成均不代表已经学会稳定侧踢。
 
 在无图形服务器上启动两张卡，每卡 1024 个环境，从零训练：
