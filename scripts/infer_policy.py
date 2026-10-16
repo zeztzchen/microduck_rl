@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import termios
 import threading
 import time
 import tty
+from pathlib import Path
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -141,6 +143,31 @@ DEFAULT_POSE = np.array([
 ], dtype=np.float32)
 
 
+def load_dance_metadata(onnx_path, metadata_path=None):
+    """Read the optional deployment sidecar and verify its model identity."""
+    path = Path(metadata_path) if metadata_path else Path(onnx_path).with_name("metadata.json")
+    if not path.exists() and metadata_path is None:
+        print("Dance metadata: no sidecar; using the legacy 61D/1.2s contract")
+        return None
+    with path.open() as stream:
+        metadata = json.load(stream)
+    if hashlib.sha256(Path(onnx_path).read_bytes()).hexdigest() != metadata.get("onnx_sha256"):
+        raise ValueError(f"Dance ONNX SHA256 does not match {path}")
+    if metadata.get("observation_normalizer_baked_in") is not True:
+        raise ValueError("Dance metadata must declare a baked-in observation normalizer")
+    deployment = metadata.get("deployment", {})
+    expected = dict(control_hz=50, physics_timestep_s=0.005, decimation=4,
+                    observation_dtype="float32", action_scale=1.0)
+    for name, value in expected.items():
+        if deployment.get(name) != value:
+            raise ValueError(f"Dance metadata {name} must be {value}")
+    period = deployment.get("period_s")
+    if not isinstance(period, (int, float)) or not math.isfinite(period) or period <= 0:
+        raise ValueError("Dance metadata period_s must be finite and greater than zero")
+    print(f"Dance metadata: {path} ({metadata.get('recipe_version')}, {metadata.get('checkpoint')})")
+    return metadata
+
+
 class TerminalInput:
     """Single-keypress reader on stdin (cbreak mode, background thread).
 
@@ -218,7 +245,20 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 kick_duration=3.0, roulade_duration=2.0,
+                 dance_onnx_path=None, dance_period=None, dance_metadata_path=None):
+        self.dance_metadata = load_dance_metadata(dance_onnx_path, dance_metadata_path) if dance_onnx_path else None
+        metadata_period = self.dance_metadata["deployment"]["period_s"] if self.dance_metadata else 1.2
+        dance_period = metadata_period if dance_period is None else dance_period
+        if not math.isfinite(dance_period) or dance_period <= 0:
+            raise ValueError("--dance-period must be finite and greater than zero")
+        if self.dance_metadata and not math.isclose(dance_period, metadata_period):
+            raise ValueError("--dance-period does not match dance metadata period_s")
+        if dance_onnx_path:
+            if not new_cmd_obs:
+                raise ValueError("--dance requires --new-cmd-obs (61D observations)")
+            if not use_projected_gravity:
+                raise ValueError("--dance requires projected gravity observations")
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -231,6 +271,22 @@ class PolicyInference:
         # body_cmd as policy COMMANDS (no add to ctrl, no joint_pos correction).
         # When False: legacy behaviour (3D command, head_offset added to ctrl[5:9]).
         self.new_cmd_obs = new_cmd_obs
+
+        self.dance_session = None
+        self.dance_mode = False
+        self.dance_phase = 0.0
+        self.dance_period = dance_period
+        if dance_onnx_path:
+            print(f"\nLoading dance policy from: {dance_onnx_path}")
+            self.dance_session = ort.InferenceSession(
+                dance_onnx_path, providers=["CPUExecutionProvider"])
+            inputs = self.dance_session.get_inputs()
+            outputs = self.dance_session.get_outputs()
+            if (len(inputs) != 1 or len(outputs) != 1
+                    or inputs[0].shape != [1, 61] or outputs[0].shape != [1, 14]
+                    or inputs[0].type != "tensor(float)" or outputs[0].type != "tensor(float)"):
+                raise ValueError("Dance ONNX must have one float32 [1, 61] input and one float32 [1, 14] output")
+            print(f"Dance policy: [1, 61] -> [1, 14], period={dance_period:.3f}s (simulation time)")
 
         # Load walking policy
         self.walking_session = None
@@ -341,8 +397,8 @@ class PolicyInference:
 
         # Validate at least one policy loaded. A sitstand policy can run alone
         # (it holds the stand at flag=0), unlike the old one-way sit policy.
-        if not self.walking_session and not self.standing_session and not self.is_sitstand:
-            raise ValueError("At least one of --walking, --standing or --sitstand must be provided")
+        if not self.walking_session and not self.standing_session and not self.is_sitstand and not self.dance_session:
+            raise ValueError("At least one of --walking, --standing, --sitstand or --dance must be provided")
 
         # Determine initial active session and policy
         if self.walking_session:
@@ -351,14 +407,13 @@ class PolicyInference:
         elif self.standing_session:
             self.current_policy = "standing"
             self.ort_session = self.standing_session
-        else:
+        elif self.is_sitstand:
             # sitstand-only: start standing (posture flag 0).
             self.current_policy = "sit"
             self.ort_session = self.sit_session
-
-        # Get input/output names from active session
-        self.input_name = self.ort_session.get_inputs()[0].name
-        self.output_name = self.ort_session.get_outputs()[0].name
+        else:
+            self.current_policy = "dance"
+            self.ort_session = self.dance_session
 
         # Get sensor IDs and body IDs
         self.imu_ang_vel_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_ang_vel")
@@ -396,6 +451,10 @@ class PolicyInference:
 
         # Default pose for the policy (flexed legs)
         self.default_pose = DEFAULT_POSE[:self.n_joints]
+        if self.dance_session is not None:
+            if self.n_joints != 14:
+                raise ValueError("Dance requires exactly 14 servo actuators")
+            self._validate_dance_metadata()
         print(f"Number of actuators: {self.n_joints}")
         print(f"Default pose: {self.default_pose}")
         print(f"Action scale: {self.action_scale}")
@@ -458,6 +517,151 @@ class PolicyInference:
             self.action_buffer = None
             self.current_lag = 0
 
+    @property
+    def input_name(self):
+        return self.ort_session.get_inputs()[0].name
+
+    @property
+    def output_name(self):
+        return self.ort_session.get_outputs()[0].name
+
+    def _validate_dance_metadata(self):
+        if self.dance_metadata is None:
+            return
+        metadata = self.dance_metadata
+        deployment = metadata["deployment"]
+        for name, tensor in (("input", self.dance_session.get_inputs()[0]),
+                             ("output", self.dance_session.get_outputs()[0])):
+            if metadata.get(name) != {"name": tensor.name, "shape": tensor.shape}:
+                raise ValueError(f"Dance {name} name/shape does not match metadata")
+        joint_names = [self.model.joint(joint_id).name for joint_id in self.model.actuator_trnid[:, 0]]
+        if deployment.get("joint_order") != joint_names:
+            raise ValueError("Dance joint order does not match metadata")
+        home = np.asarray(deployment.get("home_rad", []), dtype=float)
+        if home.shape != (14,) or not np.allclose(home, self.default_pose, atol=0.000051, rtol=0):
+            raise ValueError("Dance HOME does not match metadata")
+        if self.action_scale != deployment["action_scale"]:
+            raise ValueError("--action-scale does not match dance metadata")
+        if not math.isclose(self.model.opt.timestep, deployment["physics_timestep_s"]):
+            raise ValueError("Dance physics timestep does not match metadata")
+        if self.bam_ctrl is None:
+            raise ValueError("Dance metadata requires BAM; remove --no-bam")
+        actuator = self.bam_ctrl.model.actuator
+        actual = dict(motor=BAM_MOTOR_NAME, model=BAM_MODEL, kp_fw=actuator.kp,
+                      vin=actuator.vin, vin_drop_gain=self.bam_ctrl.vin_drop_gain,
+                      vin_min=self.bam_ctrl.vin_min, max_current=actuator.max_current)
+        if deployment.get("bam") != actual:
+            raise ValueError(f"BAM settings do not match dance metadata: {actual}")
+
+    def _dance_blocks(self, action):
+        if self.current_policy == "dance":
+            print(f"Cannot {action} while the dance policy owns control; press X to return to walking/standing")
+            return True
+        return False
+
+    def toggle_dance(self):
+        if self.dance_mode:
+            self.stop_dance()
+            return
+        if self.dance_session is None:
+            print("Dance unavailable: no --dance policy loaded")
+            return
+        if self.ground_pick_mode or self.sit_mode or self.slope_mode or self.behavior_mode is not None:
+            print(f"Cannot start dance during {self.current_policy}; finish that mode first")
+            return
+        self.vel_cmd[:] = 0.0
+        self.head_offset[:] = 0.0
+        self.body_cmd[:] = 0.0
+        self.head_mode = False
+        self.body_pose_mode = False
+        self.dance_phase = 0.0
+        self.dance_mode = True
+        self.current_policy = "dance"
+        self.ort_session = self.dance_session
+        self._update_command()
+        print(f"Dance: ON (phase=0, period={self.dance_period:.3f}s; D/SPACE stops, T pauses)")
+
+    def stop_dance(self):
+        if self.current_policy != "dance":
+            return
+        self.dance_mode = False
+        self.dance_phase = 0.0
+        self.vel_cmd[:] = 0.0
+        self.head_offset[:] = 0.0
+        self.body_cmd[:] = 0.0
+        self.head_mode = False
+        self.body_pose_mode = False
+        self._update_command()
+        print("Dance: IDLE (same ONNX, zero commands, closed-loop inference; X returns to walking/standing)")
+
+    def leave_dance(self):
+        if self.current_policy != "dance":
+            return
+        if self.standing_session is not None:
+            name, session = "standing", self.standing_session
+        elif self.walking_session is not None:
+            name, session = "walking", self.walking_session
+        elif self.is_sitstand:
+            name, session = "sit", self.sit_session
+        else:
+            print("No walking/standing/sitstand policy loaded; D/SPACE can still stop to dance idle")
+            return
+        self.stop_dance()
+        self.current_policy, self.ort_session = name, session
+        self._update_command()
+        print(f"Dance: EXIT -> {name} (zero commands)")
+
+    def reset_to_stand(self):
+        """Reset physics, raw-action history, BAM state and modes to dance idle."""
+        if self.dance_session is None:
+            raise ValueError("Reset to dance idle requires --dance")
+        stand_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "STAND")
+        if stand_id < 0:
+            raise ValueError("Dance scene must provide the STAND keyframe")
+        mujoco.mj_resetDataKeyframe(self.model, self.data, stand_id)
+        self.dance_mode = self.ground_pick_mode = self.sit_mode = self.slope_mode = False
+        self.dance_phase = self.ground_pick_phase = 0.0
+        self.behavior_mode = None
+        self.behavior_time_left = 0.0
+        self.head_mode = self.body_pose_mode = False
+        self.vel_cmd[:] = self.head_offset[:] = self.body_cmd[:] = 0.0
+        self.last_action[:] = 0.0
+        if self.action_buffer is not None:
+            for action in self.action_buffer:
+                action[:] = 0.0
+            self.buffer_index = 0
+        self.current_policy, self.ort_session = "dance", self.dance_session
+        self._update_command()
+        if self.bam_ctrl is not None:
+            self.bam_ctrl.reset(self.data.qpos)
+            self.bam_ctrl.last_ts = self.data.time
+        self.set_position_targets(self.default_pose)
+        mujoco.mj_forward(self.model, self.data)
+        print("Reset: STAND, dance idle, phase=0, previous action=0")
+
+    def update_dance_phase(self, sim_dt, inference_enabled=True):
+        """Advance only by simulated time spent with inference enabled."""
+        if not self.dance_mode or not inference_enabled:
+            return
+        self.dance_phase = (self.dance_phase + sim_dt / self.dance_period) % 1.0
+        self._update_command()
+
+    def handle_dance_key(self, key):
+        if key == "d":
+            self.toggle_dance()
+            return True
+        if self.current_policy == "dance" and key == " ":
+            self.stop_dance()
+            return True
+        if self.current_policy == "dance" and key == "x":
+            self.leave_dance()
+            return True
+        if self.current_policy == "dance" and key in ("up", "down", "left", "right", "a", "e", "z", "s",
+                                       "h", "b", "g", "y", "r", "k", "l"):
+            self._dance_blocks(f"use {key.upper()}")
+            return True
+        return False
+
     def _update_command(self):
         """Update self.command (fed into obs) based on current policy and commands.
 
@@ -472,6 +676,12 @@ class PolicyInference:
         keyboard yet). ground_pick still owns slots [0..2] for phase encoding.
         """
         if self.new_cmd_obs:
+            if self.current_policy == "dance":
+                self.command = np.zeros(13, dtype=np.float32)
+                if self.dance_mode:
+                    angle = 2 * np.pi * self.dance_phase
+                    self.command[:2] = [np.cos(angle), np.sin(angle)]
+                return
             if self.behavior_mode is not None:
                 # Kick/roulade were trained with an all-zero 13D command
                 # (twist ~0, head/body slots zero-padded) — feeding stale
@@ -514,6 +724,8 @@ class PolicyInference:
 
     def _update_policy_session(self):
         """Switch between walking and standing sessions based on vel_cmd magnitude."""
+        if self.current_policy == "dance":
+            return
         if not (self.walking_session and self.standing_session):
             return  # Only one policy loaded, no switching
         if self.ground_pick_mode:
@@ -535,6 +747,8 @@ class PolicyInference:
 
     def set_vel_cmd(self, lin_vel_x=0.0, lin_vel_y=0.0, ang_vel_z=0.0):
         """Set velocity command (used for walking / policy switching)."""
+        if self._dance_blocks("set velocity"):
+            return
         self.vel_cmd = np.array([lin_vel_x, lin_vel_y, ang_vel_z], dtype=np.float32)
         self._update_policy_session()
         self._update_command()
@@ -542,6 +756,8 @@ class PolicyInference:
 
     def toggle_body_pose_mode(self):
         """Toggle body pose control mode on/off."""
+        if self._dance_blocks("control body pose"):
+            return
         self.body_pose_mode = not self.body_pose_mode
         if self.body_pose_mode:
             print("Body pose mode: ON")
@@ -557,6 +773,8 @@ class PolicyInference:
 
     def toggle_slope_mode(self):
         """Toggle slope policy mode on/off (passive descent, zero twist command)."""
+        if self._dance_blocks("toggle slope mode"):
+            return
         if self.slope_session is None:
             print("Slope unavailable: no --slope policy loaded")
             return
@@ -603,6 +821,8 @@ class PolicyInference:
         return {"z": 0, "pitch": 1, "roll": 2}[axis]
 
     def bump_body(self, axis: str, delta: float):
+        if self._dance_blocks("control body pose"):
+            return
         idx = self._body_idx(axis)
         cap = BODY_CMD_MAX_Z if axis == "z" else BODY_CMD_MAX_XY if axis in ("x", "y") else BODY_CMD_MAX_ANGLE
         self.body_cmd[idx] = float(np.clip(self.body_cmd[idx] + delta, -cap, cap))
@@ -683,6 +903,8 @@ class PolicyInference:
 
     def trigger_ground_pick(self):
         """Start one ground pick cycle. Automatically returns to walking when done."""
+        if self._dance_blocks("ground pick"):
+            return
         if self.ground_pick_session is None:
             print("Ground pick unavailable: no --ground-pick policy loaded")
             return
@@ -736,6 +958,8 @@ class PolicyInference:
         all-zero command and end standing, so triggering is a session swap; a
         timer hands control back to walking/standing afterwards.
         """
+        if self._dance_blocks(f"start {name}"):
+            return
         session = self.behavior_sessions.get(name)
         if session is None:
             print(f"{name} unavailable: no --{name.replace('_', '-')} policy loaded")
@@ -816,6 +1040,8 @@ class PolicyInference:
         standing (it holds the stand); a velocity command switches back to
         walking/standing as usual.
         """
+        if self._dance_blocks("sit"):
+            return
         if self.sit_session is None:
             print("Sit unavailable: no --sit/--sitstand policy loaded")
             return
@@ -847,6 +1073,8 @@ class PolicyInference:
 
     def toggle_head_mode(self):
         """Toggle head control mode on/off."""
+        if self._dance_blocks("control the head"):
+            return
         self.head_mode = not self.head_mode
         if self.head_mode:
             print("Head mode: ON")
@@ -860,6 +1088,8 @@ class PolicyInference:
         obs_batch = obs.reshape(1, -1)
         action = self.ort_session.run([self.output_name], {self.input_name: obs_batch})[0]
         action = action.squeeze(0).astype(np.float32)
+        if self.current_policy == "dance" and (action.shape != (14,) or not np.isfinite(action).all()):
+            raise ValueError("Dance policy returned invalid actions; stopping before applying motor targets")
         self.last_action = action.copy()
         return action
 
@@ -1180,6 +1410,12 @@ def main():
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
+    parser.add_argument("--dance", type=str, default=None,
+                        help="Path to dance ONNX (D starts/stops to same-policy idle, X exits). Requires --new-cmd-obs; can run standalone.")
+    parser.add_argument("--dance-period", type=float, default=None,
+                        help="Dance cycle in simulation seconds (default: metadata period_s, otherwise 1.2)")
+    parser.add_argument("--dance-metadata", type=str, default=None,
+                        help="Deployment metadata JSON (default: metadata.json beside the dance ONNX, if present)")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
@@ -1232,8 +1468,19 @@ def main():
                              "compare drift; combine with --odom-anchor-points to see each anchor.")
     args = parser.parse_args()
 
-    if not args.walking and not args.standing and not args.sitstand:
-        parser.error("At least one of --walking, --standing or --sitstand must be provided")
+    if args.dance_period is not None and (not math.isfinite(args.dance_period) or args.dance_period <= 0):
+        parser.error("--dance-period must be finite and greater than zero")
+    if args.dance_metadata and not args.dance:
+        parser.error("--dance-metadata requires --dance")
+    if args.dance:
+        if not args.new_cmd_obs:
+            parser.error("--dance requires --new-cmd-obs (61D observations)")
+        if args.roller:
+            parser.error("--dance was trained on groundcontact, not the roller model")
+        if args.raw_accelerometer:
+            parser.error("--dance requires projected gravity; remove --raw-accelerometer")
+    if not args.walking and not args.standing and not args.sitstand and not args.dance:
+        parser.error("At least one of --walking, --standing, --sitstand or --dance must be provided")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
     if (args.kick_left or args.kick_right or args.roulade) and not args.new_cmd_obs:
@@ -1270,6 +1517,11 @@ def main():
             "Use a desktop/VNC session or working X11 forwarding. "
             "MUJOCO_GL=egl does not provide an interactive viewer."
         )
+
+    if sys.platform == "darwin" and getattr(mujoco.viewer, "_MJPYTHON", None) is None:
+        parser.error("macOS requires mjpython: use 'uv run --no-sync mjpython scripts/infer_policy.py ...'")
+    if os.environ.get("MUJOCO_GL", "").lower() == "disable":
+        parser.error("Interactive viewer requires rendering; unset MUJOCO_GL (server evaluation uses disable)")
 
     # Load MuJoCo model. Kick policies get a scene with a ball to kick.
     # --scene overrides everything (any scene whose robot has the standard
@@ -1355,8 +1607,16 @@ def main():
         roulade_onnx_path=args.roulade,
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
+        dance_onnx_path=args.dance,
+        dance_period=args.dance_period,
+        dance_metadata_path=args.dance_metadata,
     )
-    policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
+    if policy.dance_metadata:
+        expected_scene = policy.dance_metadata["deployment"].get("scene")
+        if not expected_scene or Path(xml_path).resolve() != Path(expected_scene).resolve():
+            parser.error("Dance scene does not match metadata; use the supplied groundcontact scene.xml")
+    if not args.dance:
+        policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
     # Set realistic wheel bearing friction for roller inference (must be done
     # programmatically — non-zero frictionloss in the XML breaks training)
@@ -1398,6 +1658,8 @@ def main():
         bam_ctrl.reset(data.qpos)   # clears voltage-drop state, q_target = current qpos
     policy.set_position_targets(policy.default_pose)
     mujoco.mj_forward(model, data)
+    if args.dance:
+        policy.reset_to_stand()
 
     # Verify observation size
     test_obs = policy.get_observations()
@@ -1434,6 +1696,8 @@ def main():
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
+    if policy.dance_session is not None:
+        print(f"Dance policy: idle, closed-loop  (D starts; period={policy.dance_period:.3f}s, simulation time)")
     _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R"}
     for _name in policy.behavior_sessions:
         print(f"{_name} policy: loaded  (press {_behavior_keys[_name]}, "
@@ -1501,8 +1765,10 @@ def main():
     quit_requested = False
 
     def handle_key(key):
-        nonlocal policy_enabled, quit_requested
+        nonlocal policy_enabled, quit_requested, policy_enable_time
         try:
+            if policy.handle_dance_key(key):
+                return
             if key == "up":
                 if policy.head_mode:
                     policy.head_offset[1] = np.clip(policy.head_offset[1] + policy.head_step, -policy.head_max, policy.head_max)
@@ -1562,6 +1828,15 @@ def main():
                 # target (no fresh ctrl writes).
                 policy_enabled = not policy_enabled
                 print(f"Policy inference: {'ON' if policy_enabled else 'OFF (paused)'}")
+                if policy.dance_mode:
+                    print(f"Dance beat: {'resumed' if policy_enabled else 'frozen'} at phase={policy.dance_phase:.6f}")
+            elif key == "0" and policy.dance_session is not None:
+                policy.reset_to_stand()
+                policy_enabled = True
+                policy_enable_time = None
+                if args.record:
+                    set_standby_gains(False)
+                vel_history.clear()
             elif key == "g":
                 policy.trigger_ground_pick()
             elif key == "k":
@@ -1630,8 +1905,13 @@ def main():
     else:
         print("  LEFT/RIGHT arrow: strafe left/right (lin_vel_y)")
         print("  A / E:            turn left/right (ang_vel_z)")
-    print("  SPACE:            coast (zero all commands)")
+    print("  SPACE:            dance idle (same policy, zero commands) / coast")
     print("  T:                toggle policy inference on/off (paused = motors hold last target)")
+    print("  D:                dance / idle (requires --dance; phase resets on start)")
+    print("  X:                exit dance policy to walking/standing; then Y/R/G/K/L work normally")
+    print("  0 (zero):         reset to STAND + dance idle, clear history, resume inference")
+    print("                    Dance/idle lock velocity/head/body commands; X releases control")
+    print("                    T freezes inference/beat, NOT physics; D/SPACE keep balance feedback")
     print("  G:                trigger ground pick (requires --ground-pick)")
     print("  Y:                toggle sit (with --sit/--sitstand) or slope mode (with --slope)")
     print("  K:                kick with LEFT foot (requires --kick-left)")
@@ -1780,6 +2060,7 @@ def main():
                         print(f"  Applied ctrl ({ctrl_kind}, first 5): {data.ctrl[:5]}")
                         print(f"  Applied ctrl ({ctrl_kind}, last 5):  {data.ctrl[-5:]}")
 
+                physics_start_time = data.time
                 for _ in range(decimation):
                     if bam_ctrl is not None:
                         # BAM owns control/torque/friction: update() runs the
@@ -1788,6 +2069,7 @@ def main():
                         # dofs so MuJoCo's solver applies it on this step.
                         bam_ctrl.update()
                     mujoco.mj_step(model, data)
+                policy.update_dance_phase(data.time - physics_start_time, policy_enabled)
 
                 if odom_compare is not None:
                     odom_compare.step(data)

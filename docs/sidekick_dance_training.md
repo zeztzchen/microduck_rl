@@ -26,17 +26,18 @@ cd microduck_rl
 日常训练的 `logs/`、`artifacts/`、`.pt`、虚拟环境不进入 Git。
 仓库的 `uv.lock` 使用公共包源；服务器本机镜像地址的重写不随任务代码提交。
 
-### 本地 agent 的任务
+### 本地推理接口（已接入）
 
-复用已有 macOS `.venv-infer` 和 `mjpython` 启动方式，读取上述 `metadata.json`。
+复用已有 macOS uv 项目环境 `.venv` 和 `mjpython`，读取上述 `metadata.json`。
 独立推理需要 MuJoCo、CPU ONNX Runtime、NumPy 和 BAM，不需要启动训练栈。
 训练对应版本为 Python 3.12、MuJoCo 3.10.0、ONNX Runtime 1.24.4；
 BAM 来自 `Rhoban/bam` 的 `mjlab_frictionloss` 分支，提交
 `62bd8ce12154340be97e06f7f41a0ca8f116d967`。
 本地 viewer 不沿用服务器的 `MUJOCO_GL=disable` 或 `DISPLAY=:99`。
 
-当前 `scripts/infer_policy.py` 尚无专用舞蹈参数。请本地 agent 接入舞蹈模式或
-独立 viewer 入口，复用已有 BAM 和观测构造，并将实现提交到这个共享仓库：
+`scripts/infer_policy.py --dance` 已接入舞蹈模式，自动读取 ONNX 同目录的
+`metadata.json`（也可通过 `--dance-metadata` 指定），检查模型 SHA256、
+输入输出、关节顺序、HOME、控制周期和 BAM 参数，复用原有观测构造：
 
 1. 每 0.02 秒从仿真获取真实状态，构造 `float32 [1,61]` 的 `obs`。
    头/身体命令为零，`obs[3:6]` 使用单位 projected gravity；
@@ -57,8 +58,99 @@ BAM 来自 `Rhoban/bam` 的 `mjlab_frictionloss` 分支，提交
    记录具体模型版本及观察结果，不能以接口通过代替动作质量评估。
 
 可参考 `scripts/eval_sidekick_reference.py` 的节拍注入和 BAM 执行循环。
-该脚本用于无渲染评估，接入 viewer 时需要处理它关闭渲染的设置。
+该脚本现在复用同一个舞蹈适配器，仅在自己的进程内关闭渲染。
 仅下载模型并执行 `--walking policy.onnx --new-cmd-obs` 不会自动开始舞蹈。
+
+### 本机启动与操作
+
+从项目根目录执行，使用已有 uv 环境，不重新同步训练依赖、不需要 CUDA：
+
+```bash
+PYTHON_LIBDIR=$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+
+env -u MUJOCO_GL -u DISPLAY \
+  DYLD_FALLBACK_LIBRARY_PATH="$PYTHON_LIBDIR:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}" \
+  uv run --no-sync mjpython scripts/infer_policy.py \
+    --walking alpha_walking.onnx \
+    --sitstand alpha_sitstand.onnx \
+    --roulade roulade.onnx \
+    --dance policies/sidekick_reference_v2/model_3000/policy.onnx \
+    --new-cmd-obs
+```
+
+前三个 ONNX 是已有本地文件，没有这些文件时删除对应参数即可；仅保留
+`--dance ... --new-cmd-obs` 也能运行。macOS 不能用普通 `python` 启动 passive
+viewer；`DYLD_FALLBACK_LIBRARY_PATH` 用于找到 uv Python 的动态库。
+启动时模型从 `STAND` 进入舞蹈策略自身的 idle，等待站稳后开始。
+
+**所有按键均在启动程序的终端输入，不是在 MuJoCo 查看器窗口输入。**
+
+| 按键 | 行为 |
+| --- | --- |
+| D | 开始舞蹈，phase 从 0 开始；再次按下进入同一舞蹈模型的 idle |
+| 空格 | 舞蹈命令清零，保持同一模型闭环，不是暂停推理 |
+| X | 显式退出舞蹈模型，交回零命令 standing/walking；只有 sitstand 时交回其站立状态 |
+| T | 暂停/恢复推理和节拍；物理仍继续，最后舵机目标保持，可能失衡 |
+| 0（数字零） | 重置 STAND、速度、外力、BAM 状态、动作历史和节拍，进入 dance idle 并恢复推理 |
+| Y / R | 坐站 / 翻滚；先按 X 退出舞蹈模型，且需要加载对应 ONNX |
+| Q | 退出 |
+
+D/空格停止后，自动 walking/standing 切换、速度键、头部/身体命令仍不能
+抢占舞蹈模型；X 才释放控制权。只有舞蹈模型时 X 给出提示，不切换到不存在的策略。
+T 不是安全的平衡保持功能；需要停止动作但保留反馈时使用 D/空格。
+默认周期来自 metadata；指定 `--dance-period` 时必须与该模型一致。
+没有 sidecar 的旧模型保留 1.2 秒默认约定，并在启动时明确提示未校验元数据。
+
+CPU 接口、模式切换、BAM 和 viewer 启动检查：
+
+```bash
+uv run --no-sync --with pytest python -m pytest \
+  tests/test_infer_policy_dance.py tests/test_infer_policy_bam.py \
+  tests/test_infer_policy_viewer.py -q
+
+uv run --no-sync python scripts/eval_sidekick_reference.py \
+  --onnx-file policies/sidekick_reference_v2/model_3000/policy.onnx \
+  --trials 3 --seconds 8 --output /tmp/sidekick-model3000-dance.json
+```
+
+评估命令加 `--idle` 可检查同模型的零命令站立。测试包括模型哈希、8 个相位与
+idle 的有限输出、单位重力、原始动作历史、仿真时间推进/暂停/重置、会话名称、
+命令互斥和坐站/翻滚回归；这些测试不代表抬脚质量或真机部署已经合格。
+
+### model_3000 的 macOS 本地验证（2026-10-16）
+
+模型 SHA256 为上文的 `573a10dc…beb2`，不是之前的 v1 `model_7999`。
+CPU 测试套件（推理、BAM、viewer 启动、两种舞蹈配置）共 76 项通过，1 项
+Linux 无 DISPLAY 检查在 macOS 跳过；训练 CLI 解析有两条已有的 tuple/list 类型警告。
+这次没有启动训练或改动模型权重。
+
+上述无渲染命令：seed=42，3 次各 8 秒，关节初始噪声 ±0.01 rad，
+左右起始相位交替，忽略首秒后每次统计 350 个控制步。名义 BAM、平地，无 DR：
+
+| 指标 | 三次试验范围 |
+| --- | --- |
+| 跌倒 | 0/3；阈值为躯干倾斜 >55° 或高度 <0.065 m |
+| 双脚同时接地 | 62.57%–63.71% |
+| 左脚踢腿峰值窗口离地比例 | 71.43%–72.73% |
+| 右脚踢腿峰值窗口离地比例 | 66.07%–69.70% |
+| 两侧峰值窗口的支撑脚接地比例 | 均为 100% |
+| 左/右摆动脚峰值窗口平均最低点离地 | 4.25–4.58 mm / 3.13–3.32 mm |
+| 平均躯干倾斜 | 1.36°–1.40° |
+| 相对重置位置的最大水平偏移 | 9.24–11.68 cm |
+| 左/右脚接地时平均接触点滑动速度 | 1.95–2.07 cm/s / 1.86–2.01 cm/s |
+
+峰值窗口定义为 `abs(sin(2*pi*phase)) > 0.85`，离地比例只以该侧峰值窗口的
+采样数为分母，不是整个回合的成功率。高度使用整个脚底碰撞网格的最低点，
+不是训练脚底 site 的目标高度。滑动速度使用静止地面上各接触点的水平速度，
+先在同一脚的接触点间平均，再对该脚接地的采样平均。
+全零 idle 的另外 3 次 8 秒测试没有跌倒，双脚接地比例均为 100%。
+
+实际 `mjpython` 窗口已验证 D/空格启停、X 退出、Y 坐站、R 翻滚返回、0 重置和 Q
+退出。T 暂停前后节拍值保持一致，但一次约 0.3 秒暂停导致失衡：物理仍在继续，
+不能把暂停推理当作站稳功能。数字 0 可恢复初始状态。
+独立离屏近景确认左右脚能交替离地，但幅度较小，头部摆动明显；结合上述漂移与
+滑动数据，当前结论是“部署接口通过，模型已经能抬脚，但尚未完成理想原地侧踢的
+动作质量验收”，不构成真机安全或长期稳定性的保证。
 
 ## 参考任务 v2：明确要求抬脚侧踢（2026-10-16 修正）
 
@@ -106,8 +198,8 @@ v2 修改的是奖励目标，旧 ONNX 的行为不会因此改变，需要重�
   关节跟踪与 actor 使用相同的编码器视图，兼容 passive/backlash 关节。
   去掉 walking 的奖励和课程，动作仍为 14 维、50 Hz、无额外滤波。
 
-v2 是待训练、待行为评估的修正版。运动学可达、测试通过和 smoke 完成
-均不代表已经学会稳定侧踢。
+v2 是修正版配方；本仓库附带 model_3000，已完成的本机验证及局限见前文。
+运动学可达、测试通过和 smoke 完成均不代表已经学会稳定侧踢。
 
 在无图形服务器上启动两张卡，每卡 1024 个环境，从零训练：
 
@@ -159,7 +251,7 @@ uv run scripts/eval_sidekick_reference.py \
 报告接地占比、峰值窗口的支撑/离地比例、脚底间距、倾斜和跌倒；
 `--idle` 可单独检查全零命令站立。最终还要在本地看动作，确认不是拖脚或轻微摆动。
 
-本机推理仍需接入前文约定的显式舞蹈节拍；不能直接套参考 README 的零速度命令。
+本机推理使用前文 `--dance` 接入的显式节拍；不能直接套参考 README 的零速度命令。
 新旧任务 ONNX 的输入/输出和节拍接口相同，学到的动作目标不同。
 
 ## 原有脚部位置版本
@@ -258,8 +350,9 @@ MUJOCO_GL=disable uv run scripts/export.py Mjlab-SideKickDance-Flat-MicroDuck \
 **部署命令约定：**观察量仍为 61D，但 `[48:51]` 槽表示
 `[cos(2πt/1.2), sin(2πt/1.2), 0]`，全零表示站立。头部和身体命令部署时为零。
 不能直接把这个 ONNX 当普通 walking 模型喂速度指令。现有
-`infer_policy.py --walking dance.onnx` 不会自动生成此舞步节拍；本次先用 `play`
-检查训练结果。真机使用前还需要在对应运行时接入连续相位及启停，并做部署回放。
+`infer_policy.py --walking dance.onnx` 不会自动生成此舞步节拍；ONNX 本地回放使用
+前文的 `--dance`，checkpoint 可用 `play` 检查。真机使用前还需要在对应运行时
+接入连续相位及启停，并做部署回放。
 现有 publish 的 constant-command 合约也不适用于这个相位策略。
 
 ## 配方与验证范围

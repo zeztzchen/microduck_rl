@@ -10,9 +10,9 @@
 - [model_3000 测试模型](policies/sidekick_reference_v2/model_3000/policy.onnx)
 - [模型版本、SHA256 和完整部署接口](policies/sidekick_reference_v2/model_3000/metadata.json)
 
-本模型需要运行时提供 **1.2 秒 cos/sin 节拍**；现有 `infer_policy.py --walking`
-不会自动生成舞蹈节拍，本地接入进度和验证要求见上面的说明。
-该版本已通过导出接口检查，实际动作仍待本地观察。
+本模型需要运行时提供 **1.2 秒 cos/sin 节拍**；使用 `infer_policy.py --dance`
+接入，不能将舞蹈模型直接当作 `--walking`。启动命令与验证范围见下面的 macOS
+说明和训练文档；接口测试通过不等于舞蹈效果已验收。
 
 <img width="2215" height="884" alt="image" src="https://github.com/user-attachments/assets/5db7cc83-b3ce-4f7c-83f0-0572a63baed7" />
 
@@ -108,6 +108,61 @@ The servos are simulated with the same BAM M6 XL330 model the policies are
 trained against (voltage control + load-dependent friction, via
 `bam.mujoco.MujocoController`); `--vin` / `--vin-drop-gain` / `--kp-fw` pin the
 training DR ranges to one value, `--no-bam` falls back to the XML PD actuators.
+
+### Local SideKickDance inference on macOS
+
+The shared `lifted_sidekick_v2` checkpoint is included at
+`policies/sidekick_reference_v2/model_3000/policy.onnx`. Its adjacent
+`metadata.json` is loaded automatically: SHA256, float32 `[1,61] -> [1,14]`,
+tensor names, HOME, joint order, timing and BAM parameters are checked.
+
+Using uv's project environment (`.venv`), run from the project root:
+
+```bash
+PYTHON_LIBDIR=$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+
+env -u MUJOCO_GL -u DISPLAY \
+  DYLD_FALLBACK_LIBRARY_PATH="$PYTHON_LIBDIR:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}" \
+  uv run --no-sync mjpython scripts/infer_policy.py \
+    --dance policies/sidekick_reference_v2/model_3000/policy.onnx \
+    --new-cmd-obs
+```
+
+The library path lets macOS's `mjpython` launcher locate uv-managed Python's
+shared library. On macOS, `uv run scripts/infer_policy.py` uses ordinary Python
+and cannot launch the passive viewer: explicitly run `mjpython` instead.
+`--no-sync` reuses the existing uv environment without resynchronizing training
+dependencies. Inference itself uses CPU MuJoCo, ONNX
+Runtime, and BAM and does not require CUDA. The default
+`scene.xml` includes `robot_groundcontact.xml`; dance does not support `--roller`.
+HOME, servo order, action scale (default 1.0), and unfiltered actions stay unchanged.
+
+The robot starts from the scene's `STAND` keyframe under the dance policy's
+zero-command idle. Type **D in the launching terminal**, not the MuJoCo viewer,
+to start dancing. D or Space stops the beat but keeps the SAME dance policy
+running in closed-loop idle. **0** resets to STAND/idle, clears action history
+and resumes inference. T pauses inference and freezes the beat, NOT physics;
+motors hold the last targets and the robot can fall. Q quits.
+
+Optionally add `--walking alpha_walking.onnx --sitstand alpha_sitstand.onnx
+--roulade roulade.onnx` using locally available models. **X** explicitly exits
+the dance policy to zero-command walking/standing (or sitstand standing).
+Then Y/R and velocity/head/body controls work normally. Dance and its idle
+mode own the command slots until X releases control.
+
+The period comes from metadata (1.2 s for model_3000); an explicit
+`--dance-period` must match it. Legacy ONNX files without a sidecar default to
+1.2 s and accept a finite positive override. At 50 Hz, the phase advances by `0.02 / dance_period` per
+active control step, independent of rendering delays. Starting resets phase to
+zero and sets `obs[48:51] = [cos(2*pi*phase), sin(2*pi*phase), 0]`; all head/body
+command slots are zero. Phase zero means `[1, 0, 0]`, distinct from idle's
+`[0, 0, 0]`. No additional observation normalization is applied.
+
+CPU interface regression tests: `uv run --no-sync --with pytest python -m pytest tests/test_infer_policy_dance.py`.
+The packaged model is tested directly; optional older local models are skipped
+when absent. See [the deployment guide](docs/sidekick_dance_training.md#本机启动与操作)
+for multi-policy launch commands and behavior measurements. Interface tests do
+not establish dance quality or hardware safety.
 
 ### Backlash variants
 
