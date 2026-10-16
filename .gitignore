@@ -12,6 +12,7 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-*/
 
 # Logs and databases
 wandb
@@ -21,9 +22,12 @@ agents
 *.pch
 nohup.out
 *.onnx
+# Selected deployment versions shared with the local inference checkout.
+!policies/sidekick_reference_v2/model_3000/policy.onnx
 beyondmimic_motions/
 artifacts/
 *.npz
+MUJOCO_LOG.TXT
 
 src/mjlab_microduck/robot/microduck.bak/*
 src/mjlab_microduck/robot/microduck_test/*

@@ -7704,3 +7704,307 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Side-kick dance: a visible clock, alternating swing feet and double support.
+# ---------------------------------------------------------------------------
+
+class SideKickDanceCommand(CommandTerm):
+    """Clock in the existing twist slot; zero is an explicitly trained idle.
+
+    Resets start at a double-support phase (0 or pi), never mid-kick. Rewards
+    read the published command too, so there is no reward-only hidden clock.
+    The unused third slot gets tiny training noise to keep its weights alive.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.phase = torch.zeros(self.num_envs, device=self.device)
+        self.idle = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._command = torch.zeros(self.num_envs, 3, device=self.device)
+
+    @property
+    def command(self):
+        return self._command
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        n = self.phase[env_ids].numel()
+        self.phase[env_ids] = 0.0
+        if self.cfg.randomize_start_side:
+            self.phase[env_ids] = torch.randint(2, (n,), device=self.device) * 0.5
+        self.idle[env_ids] = torch.rand(n, device=self.device) < self.cfg.idle_probability
+        self._command[env_ids, 2] = torch.empty(n, device=self.device).uniform_(-0.001, 0.001)
+        self._update_command()
+        return {}
+
+    def compute(self, dt):
+        self.phase = (self.phase + dt / self.cfg.period) % 1.0
+        self._update_command()
+
+    def _update_command(self):
+        self._command[:, 0] = torch.cos(2 * torch.pi * self.phase)
+        self._command[:, 1] = torch.sin(2 * torch.pi * self.phase)
+        self._command[self.idle] = 0.0
+
+    def _resample_command(self, env_ids):
+        pass
+
+    def _update_metrics(self):
+        pass
+
+
+@_dataclass(kw_only=True)
+class SideKickDanceCommandCfg(CommandTermCfg):
+    period: float = 1.2
+    idle_probability: float = 0.1
+    randomize_start_side: bool = True
+
+    def build(self, env):
+        if self.period <= 0 or not 0 <= self.idle_probability <= 1:
+            raise ValueError("Dance period must be positive; idle_probability must be in [0, 1]")
+        return SideKickDanceCommand(self, env)
+
+
+def sidekick_dance_swing(command: torch.Tensor) -> torch.Tensor:
+    """Smooth [left, right] pulses in [0, 1], with double support near crossings."""
+    sine = command[:, 1]
+    pulse = ((sine.abs() - 0.25) / 0.75).clamp(0.0, 1.0).square()
+    return torch.stack((pulse * (sine < 0), pulse * (sine > 0)), dim=-1)
+
+
+def sidekick_dance_balance(env, stand_height: float = 0.1155):
+    """Positive only at a useful standing height/orientation (no flop rewards)."""
+    data = env.scene["robot"].data
+    height = data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    tilt_error = 2 * data.root_link_quat_w[:, 1:3].square().sum(dim=-1)
+    score = torch.exp(-tilt_error / 0.12 - ((height - stand_height) / 0.025).square())
+    return score * (height > 0.065) * (tilt_error < 0.5)
+
+
+def _sidekick_contacts(env):
+    # Contact sensor matches left_foot_collision then right_foot_collision;
+    # cfg tests check the geom order on both the plain and backlash models.
+    found = env.scene.sensors["feet_ground_contact"].data.found
+    return (found.reshape(env.num_envs, 2, -1).sum(dim=-1) > 0).float()
+
+
+def sidekick_dance_tracking(
+    env, feet_cfg: SceneEntityCfg, lift_height: float = 0.012,
+    side_distance: float = 0.012, foot_width: float = 0.084,
+    rest_height: float = 0.0005, stand_height: float = 0.1155,
+):
+    """Track foot height and lateral separation while the stance foot supports.
+
+    Separation (rather than feet relative to the trunk) permits the lateral
+    weight transfer needed for one-foot balance. Targets are in metres and
+    the yaw frame, so no servo indices or encoder-view joint targets are used.
+    """
+    data = env.scene["robot"].data
+    swing = sidekick_dance_swing(env.command_manager.get_command("twist"))
+    feet = data.site_pos_w[:, feet_cfg.site_ids]
+    height = feet[:, :, 2] - env.scene.env_origins[:, None, 2]
+    target = rest_height + lift_height * swing
+    height_error = ((height - target) / 0.008).square().sum(dim=-1)
+    delta = feet[:, 0, :2] - feet[:, 1, :2]
+    yaw = data.heading_w
+    dx = torch.cos(yaw) * delta[:, 0] + torch.sin(yaw) * delta[:, 1]
+    dy = -torch.sin(yaw) * delta[:, 0] + torch.cos(yaw) * delta[:, 1]
+    width = foot_width + side_distance * swing.sum(dim=-1)
+    shape_error = (dx / 0.025).square() + ((dy - width) / 0.012).square()
+    support = (_sidekick_contacts(env) + (swing > 0.01)).clamp(max=1).prod(dim=-1)
+    return torch.exp(-height_error - shape_error) * support * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_dance_contact(env, stand_height: float = 0.1155):
+    """Correct stance/swing contacts; jumping and planted-foot shuffling lose."""
+    swing = sidekick_dance_swing(env.command_manager.get_command("twist"))
+    desired = (swing < 0.1).float()
+    matched = (1 - (_sidekick_contacts(env) - desired).abs()).prod(dim=-1)
+    return matched * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_dance_drift_cost(env):
+    """Nonnegative drift cost; allow lateral weight shifts more than forward travel."""
+    data = env.scene["robot"].data
+    velocity = data.root_link_lin_vel_b
+    return velocity[:, 0].square() + 0.1 * velocity[:, 1].square() + 0.1 * data.root_link_ang_vel_b[:, 2].square()
+
+
+def sidekick_dance_slip_cost(env, feet_cfg: SceneEntityCfg):
+    """Nonnegative contact-foot slip cost, independent of velocity commands."""
+    velocity = env.scene["robot"].data.site_lin_vel_w[:, feet_cfg.site_ids, :2]
+    return (velocity.square().sum(dim=-1) * _sidekick_contacts(env)).sum(dim=-1)
+
+
+# Hip-yaw reference recipe (pezzonovante7/microduck-sidekick-dance).
+# Separate from the foot-space recipe above so existing checkpoints keep their
+# reward/command contract. All selected positions use the actor encoder view.
+def sidekick_reference_hip_yaw_track(
+    env, asset_cfg: SceneEntityCfg, std: float = 0.25, yaw_target: float = 0.4,
+) -> torch.Tensor:
+    """Smooth positive hip yaw during extension, then recover before touchdown.
+
+    asset_cfg selects (left_hip_yaw, right_hip_yaw), in that order. Selection
+    resolves by name, including on models with interleaved passive joints.
+    Zero phase command means idle: both targets return to HOME (zero yaw).
+    """
+    relative_pos = joint_pos_rel_backlash(env, biased=True, asset_cfg=asset_cfg)
+    asset = env.scene[asset_cfg.name]
+    q = relative_pos + asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    command = env.command_manager.get_command("twist")
+    _, extension = sidekick_reference_targets(command)
+    targets = extension * yaw_target
+    return torch.exp(-(q - targets).square().sum(dim=-1) / (std * std))
+
+
+def sidekick_reference_home_pose(
+    env, asset_cfg: SceneEntityCfg, std: float = 0.3, stand_height: float | None = None,
+) -> torch.Tensor:
+    """Reference mean per-joint HOME Gaussian, in the observed encoder view."""
+    error = joint_pos_rel_backlash(env, biased=True, asset_cfg=asset_cfg)
+    score = torch.exp(-(error / std).square()).mean(dim=-1)
+    return score if stand_height is None else score * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_reference_stay_put(env, std: float = 0.08, stand_height: float | None = None) -> torch.Tensor:
+    """Reference forward-speed Gaussian (positive reward, positive weight)."""
+    forward = env.scene["robot"].data.root_link_lin_vel_b[:, 0]
+    score = torch.exp(-forward.square() / (std * std))
+    return score if stand_height is None else score * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_reference_targets(command: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[left, right] lift/extension envelopes, from the actor's visible clock.
+
+    Lift starts before extension and ends after recovery. Both pulses are zero
+    at phase crossings (double support) and at idle. Squared ramps have zero
+    slope at their endpoints, unlike the original discontinuous yaw targets.
+    """
+    sine = command[:, 1].clamp(-1.0, 1.0)
+    active = command[:, :2].square().sum(dim=-1) > 0.5
+    sides = torch.stack((sine < 0, sine > 0), dim=-1) * active[:, None]
+    lift = ((sine.abs() - 0.15) / 0.85).clamp(0.0, 1.0).square()
+    extension = ((sine.abs() - 0.5) / 0.5).clamp(0.0, 1.0).square()
+    return lift[:, None] * sides, extension[:, None] * sides
+
+
+def _sidekick_reference_contacts(env) -> torch.Tensor:
+    # Separate named sensors: never assume geom/contact array ordering.
+    return torch.stack([
+        single_foot_grounded_reward(env, f"{side}_support_contact")
+        for side in ("left", "right")
+    ], dim=-1)
+
+
+def _sidekick_reference_support(env):
+    lift, extension = sidekick_reference_targets(env.command_manager.get_command("twist"))
+    contacts = _sidekick_reference_contacts(env)
+    # During transfer require BOTH feet. During swing require the opposite foot.
+    supported = ((contacts > 0.5) | (lift > 0.05)).all(dim=-1).float()
+    # Ignore swing-foot contact during the brief lift/landing transition, but
+    # require it to be airborne during the actual kick. Toe pivots cannot pass.
+    airborne = ((contacts < 0.5) | (lift <= 0.2)).all(dim=-1).float()
+    return lift, extension, supported, supported * airborne
+
+
+def _sidekick_reference_geometry(env, feet_cfg: SceneEntityCfg):
+    data = env.scene[feet_cfg.name].data
+    feet = data.site_pos_w[:, feet_cfg.site_ids]
+    height = feet[:, :, 2] - env.scene.env_origins[:, None, 2]
+    delta = feet[:, 0, :2] - feet[:, 1, :2]
+    yaw = data.heading_w
+    forward = torch.cos(yaw) * delta[:, 0] + torch.sin(yaw) * delta[:, 1]
+    width = -torch.sin(yaw) * delta[:, 0] + torch.cos(yaw) * delta[:, 1]
+    return height, forward, width
+
+
+def sidekick_reference_foot_track(
+    env, feet_cfg: SceneEntityCfg, lift_height: float, side_distance: float,
+    foot_width: float, rest_height: float, stand_height: float,
+    height_std: float = 0.008, width_std: float = 0.012,
+) -> torch.Tensor:
+    """Main v2 score: lifted side kick/recovery with correct support contacts.
+
+    Moving both feet together, a planted toe pivot, a hop, or lifting the wrong
+    foot cannot collect this reward in the kick window. Yaw-frame separation
+    permits the trunk weight shift needed for single-foot balance.
+    """
+    lift, extension, _, contact_match = _sidekick_reference_support(env)
+    height, forward, width = _sidekick_reference_geometry(env, feet_cfg)
+    height_error = ((height - rest_height - lift_height * lift) / height_std).square().sum(-1)
+    width_target = foot_width + side_distance * extension.sum(-1)
+    shape_error = ((width - width_target) / width_std).square() + (forward / 0.025).square()
+    return torch.exp(-height_error - shape_error) * contact_match * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_reference_clearance(
+    env, feet_cfg: SceneEntityCfg, lift_height: float, rest_height: float,
+    stand_height: float, height_std: float = 0.008,
+) -> torch.Tensor:
+    """Dense exploration signal before liftoff; too small to replace a kick.
+
+    The main tracking and hip-yaw rewards still require the swing foot airborne.
+    Keep a height gradient while it is touching the floor, but never pay if the
+    required support foot is absent or the robot has fallen.
+    """
+    lift, _, supported, _ = _sidekick_reference_support(env)
+    height, _, _ = _sidekick_reference_geometry(env, feet_cfg)
+    error = ((height - rest_height - lift_height * lift) / height_std).square().sum(-1)
+    return torch.exp(-error) * supported * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_reference_contact(env, stand_height: float) -> torch.Tensor:
+    return _sidekick_reference_support(env)[3] * sidekick_dance_balance(env, stand_height)
+
+
+def sidekick_reference_hip_yaw_reward(
+    env, asset_cfg: SceneEntityCfg, stand_height: float, std: float = 0.25,
+    yaw_target: float = 0.4,
+) -> torch.Tensor:
+    # Hip style is secondary; dragging the feet cannot earn it during a kick.
+    return sidekick_reference_hip_yaw_track(env, asset_cfg, std, yaw_target) * sidekick_reference_contact(env, stand_height)
+
+
+def sidekick_reference_hop_cost(env) -> torch.Tensor:
+    """Nonnegative: both soles airborne. Use a negative reward weight."""
+    return (_sidekick_reference_contacts(env).sum(-1) == 0).float()
+
+
+def sidekick_reference_slip_cost(env, feet_cfg: SceneEntityCfg) -> torch.Tensor:
+    velocity = env.scene[feet_cfg.name].data.site_lin_vel_w[:, feet_cfg.site_ids, :2]
+    return (velocity.square().sum(-1) * _sidekick_reference_contacts(env)).sum(-1)
+
+
+def sidekick_reference_metric(
+    env, feet_cfg: SceneEntityCfg, metric: str, foot_width: float,
+) -> torch.Tensor:
+    """Unweighted per-step measurements, reported via MetricsManager.
+
+    Heights refer to the sole sites, not the lowest mesh vertex. The separate
+    CPU rehearsal measures whole-sole clearance. Kick-window counters share
+    the same denominator (all steps); divide airborne_kick by kick_window for
+    the contact-match fraction conditional on being in that window.
+    """
+    contacts = _sidekick_reference_contacts(env)
+    lift, _ = sidekick_reference_targets(env.command_manager.get_command("twist"))
+    if metric == "both_grounded":
+        return contacts.prod(-1)
+    if metric == "both_airborne":
+        return (contacts.sum(-1) == 0).float()
+    if metric == "kick_window":
+        return (lift.max(-1).values > 0.2).float()
+    if metric == "airborne_kick":
+        return (((lift > 0.2) & (contacts < 0.5)).any(-1) & (contacts.sum(-1) == 1)).float()
+    if metric == "support_lost":
+        return 1.0 - _sidekick_reference_support(env)[2]
+    height, _, width = _sidekick_reference_geometry(env, feet_cfg)
+    if metric == "left_site_height_m":
+        return height[:, 0]
+    if metric == "right_site_height_m":
+        return height[:, 1]
+    if metric == "lateral_extension_m":
+        return width - foot_width
+    raise ValueError(f"Unknown sidekick metric: {metric}")

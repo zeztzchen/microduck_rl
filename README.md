@@ -1,5 +1,19 @@
 # Microduck RL
 
+## 服务器训练与本地推理共享仓库
+
+本 fork 使用 [zeztzchen/microduck_rl](https://github.com/zeztzchen/microduck_rl)
+的 `develop` 分支同步训练代码、机器人资源、推理脚本和选定的 ONNX 测试版本。
+当前舞蹈任务为 `Mjlab-SideKickReference-Flat-MicroDuck`（`lifted_sidekick_v2`）。
+
+- [训练、同步和本地 agent 接入说明](docs/sidekick_dance_training.md#共享仓库与本地推理接入)
+- [model_3000 测试模型](policies/sidekick_reference_v2/model_3000/policy.onnx)
+- [模型版本、SHA256 和完整部署接口](policies/sidekick_reference_v2/model_3000/metadata.json)
+
+本模型需要运行时提供 **1.2 秒 cos/sin 节拍**；现有 `infer_policy.py --walking`
+不会自动生成舞蹈节拍，本地接入进度和验证要求见上面的说明。
+该版本已通过导出接口检查，实际动作仍待本地观察。
+
 <img width="2215" height="884" alt="image" src="https://github.com/user-attachments/assets/5db7cc83-b3ce-4f7c-83f0-0572a63baed7" />
 
 

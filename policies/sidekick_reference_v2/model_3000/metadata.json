@@ -1,0 +1,151 @@
+{
+  "task": "Mjlab-SideKickReference-Flat-MicroDuck",
+  "recipe_version": "lifted_sidekick_v2",
+  "checkpoint": "model_3000.pt",
+  "checkpoint_iteration": 3000,
+  "checkpoint_sha256": "7d40933a3c5739647c30d233b9cf4238180cbdfc0898f538612993752d456a11",
+  "onnx": "policy.onnx",
+  "onnx_bytes": 793813,
+  "onnx_sha256": "573a10dc28711f30f48fdc71451843587cea708114f3cedc1163af38fbcebeb2",
+  "validated_at": "2026-10-16T15:56:24.245210",
+  "input": {
+    "name": "obs",
+    "shape": [
+      1,
+      61
+    ]
+  },
+  "output": {
+    "name": "actions",
+    "shape": [
+      1,
+      14
+    ]
+  },
+  "observation_normalizer_baked_in": true,
+  "finite_outputs": {
+    "dance_phases": 8,
+    "idle": true
+  },
+  "deployment": {
+    "control_hz": 50,
+    "period_s": 1.2,
+    "obs_3_6": "projected gravity, not raw accelerometer",
+    "obs_48_51": "[cos(2*pi*t/1.2), sin(2*pi*t/1.2), 0]",
+    "obs_51_61": "zeros for head/body commands",
+    "idle_command": "all 13 command entries zero",
+    "action": "14 HOME-relative joint position offsets, scale=1.0, BAM, no extra low-pass filter",
+    "scene": "src/mjlab_microduck/robot/microduck/scene.xml",
+    "physics_timestep_s": 0.005,
+    "decimation": 4,
+    "observation_dtype": "float32",
+    "observation_layout": [
+      {
+        "slice": [
+          0,
+          3
+        ],
+        "name": "base_ang_vel",
+        "units": "rad/s"
+      },
+      {
+        "slice": [
+          3,
+          6
+        ],
+        "name": "projected_gravity",
+        "units": "unit direction"
+      },
+      {
+        "slice": [
+          6,
+          20
+        ],
+        "name": "joint_pos_minus_home",
+        "units": "rad"
+      },
+      {
+        "slice": [
+          20,
+          34
+        ],
+        "name": "joint_vel",
+        "units": "rad/s"
+      },
+      {
+        "slice": [
+          34,
+          48
+        ],
+        "name": "previous_raw_action"
+      },
+      {
+        "slice": [
+          48,
+          51
+        ],
+        "name": "dance_clock_cos_sin_zero"
+      },
+      {
+        "slice": [
+          51,
+          55
+        ],
+        "name": "head_pose_command_zero"
+      },
+      {
+        "slice": [
+          55,
+          61
+        ],
+        "name": "body_pose_command_zero"
+      }
+    ],
+    "joint_order": [
+      "left_hip_yaw",
+      "left_hip_roll",
+      "left_hip_pitch",
+      "left_knee",
+      "left_ankle",
+      "neck_pitch",
+      "head_pitch",
+      "head_yaw",
+      "head_roll",
+      "right_hip_yaw",
+      "right_hip_roll",
+      "right_hip_pitch",
+      "right_knee",
+      "right_ankle"
+    ],
+    "home_rad": [
+      0.0,
+      -0.0873,
+      -0.4579,
+      -0.0049,
+      0.453,
+      0.3491,
+      0.3491,
+      0.0,
+      0.0,
+      0.0,
+      0.0873,
+      0.4579,
+      0.0049,
+      -0.453
+    ],
+    "action_scale": 1.0,
+    "bam": {
+      "motor": "xl330",
+      "model": "m6",
+      "kp_fw": 200.0,
+      "vin": 7.4,
+      "vin_drop_gain": 0.1,
+      "vin_min": 6.0,
+      "max_current": null
+    },
+    "inference_note": "A runtime dance clock must update the command before each inference; the original --walking entry does not generate this clock automatically."
+  },
+  "behavior_evaluation": "Export validation only; user will test the motion locally.",
+  "training_run": "2026-10-16_13-54-26_sidekick_reference_v2_20261016_134844_363a37",
+  "upstream_repository": "https://github.com/pollen-robotics/microduck_rl"
+}

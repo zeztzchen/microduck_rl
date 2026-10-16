@@ -1258,6 +1258,19 @@ def main():
             print("Error: --delay accepts 0, 1, or 2 arguments")
             return
 
+    # launch_passive initializes GLFW in a background thread and waits for a
+    # viewer handle. If initialization fails, that thread raises but the caller
+    # can wait forever. Reject a missing Linux display before changing terminal
+    # mode; leave GLFW initialization and teardown entirely to the viewer.
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        parser.error(
+            "No graphical display configured (DISPLAY/WAYLAND_DISPLAY). "
+            "Use a desktop/VNC session or working X11 forwarding. "
+            "MUJOCO_GL=egl does not provide an interactive viewer."
+        )
+
     # Load MuJoCo model. Kick policies get a scene with a ball to kick.
     # --scene overrides everything (any scene whose robot has the standard
     # 14-servo layout works, e.g. scene_allcollisions.xml).
