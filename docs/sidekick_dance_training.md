@@ -1,5 +1,8 @@
 # 侧踢舞步训练
 
+训练原理、61 维观测、14 维动作和仿真到真机的差距，见
+[Microduck 强化学习训练与仿真到真机迁移](rl_training_and_sim2real.md)。
+
 ## 共享仓库与本地推理接入
 
 服务器与本地统一使用 <https://github.com/zeztzchen/microduck_rl> 的 `develop`

@@ -6,6 +6,7 @@
 的 `develop` 分支同步训练代码、机器人资源、推理脚本和选定的 ONNX 测试版本。
 当前舞蹈任务为 `Mjlab-SideKickReference-Flat-MicroDuck`（`lifted_sidekick_v2`）。
 
+- [中文学习说明：PPO 训练流程、61 维输入、14 维输出与 sim-to-real](docs/rl_training_and_sim2real.md)
 - [训练、同步和本地 agent 接入说明](docs/sidekick_dance_training.md#共享仓库与本地推理接入)
 - [model_6000 测试模型 ONNX](policies/sidekick_reference_v2/model_6000/policy.onnx)
 - [model_6000 训练 checkpoint](policies/sidekick_reference_v2/model_6000/model_6000.pt)
